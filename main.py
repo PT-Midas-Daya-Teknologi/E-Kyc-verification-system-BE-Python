@@ -1,4 +1,6 @@
 import cv2
+import numpy as np
+import base64
 import json
 import logging
 import datetime
@@ -7,9 +9,11 @@ import face_recognition
 from flask_cors import CORS
 from deepface import DeepFace
 from flask import Flask, Response, request, jsonify
+from fastapi import FastAPI, WebSocket
 
-app = Flask(__name__)
-CORS(app)
+# app = Flask(__name__)
+# CORS(app)
+app = FastAPI()
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 file_handler = logging.FileHandler('face_recognition.log')
@@ -17,7 +21,7 @@ logger.addHandler(file_handler)
 
 def detect_facial_attribute_analysis(frame):
     demography = DeepFace.analyze(frame, actions=['age', 'gender', 'emotion', 'race'], enforce_detection=False,
-                                  detector_backend='dlib')
+                                  detector_backend='dlib', anti_spoofing=True)
     if demography is not None and len(demography) > 1:
         logger.debug('Detected %s faces', format(len(demography)))
         return None
@@ -158,9 +162,42 @@ def gen_frames():
         out.release()
         cv2.destroyAllWindows()
 
-@app.route('/video_feed')
-def video_feed():
-    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+# @app.route('/video_feed')
+# def video_feed():
+#     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    file_name = "demo-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + ".avi"
+    out = cv2.VideoWriter(file_name, fourcc, 10.0, (640, 480))
+
+    try:
+        while True:
+            # Receive base64 encoded frame from React
+            data = await websocket.receive_text()
+
+            # Decode the base64 string to an image
+            header, encoded = data.split(",", 1)
+            data_bytes = base64.b64decode(encoded)
+            np_data = np.frombuffer(data_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(np_data, cv2.IMREAD_COLOR)
+
+            # --- PROCESS FRAME HERE (e.g., Face Detection) ---
+            # Example: grayscale conversion
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            out.write(frame)
+            # out.release()
+
+            # (Optional) Send result back to React
+            await websocket.send_text("Frame Processed")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        await websocket.close()
 
 if __name__ == '__main__':
     app.run(debug=True)
