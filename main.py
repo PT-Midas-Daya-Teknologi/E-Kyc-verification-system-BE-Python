@@ -1,4 +1,8 @@
+import uuid
+from typing import Any, Annotated
+
 import cv2
+import numpy
 import numpy as np
 import base64
 import json
@@ -6,10 +10,8 @@ import logging
 import datetime
 import pytesseract
 import face_recognition
-from flask_cors import CORS
 from deepface import DeepFace
-from flask import Flask, Response, request, jsonify
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, UploadFile, Form
 
 # app = Flask(__name__)
 # CORS(app)
@@ -20,32 +22,37 @@ file_handler = logging.FileHandler('face_recognition.log')
 logger.addHandler(file_handler)
 
 def detect_facial_attribute_analysis(frame):
-    demography = DeepFace.analyze(frame, actions=['age', 'gender', 'emotion', 'race'], enforce_detection=False,
-                                  detector_backend='dlib', anti_spoofing=True)
+    logger.info('Inside detect_facial_attribute_analysis()')
+    demography = DeepFace.analyze(frame, actions=['age', 'gender', 'emotion', 'race'], enforce_detection=False, detector_backend='dlib')
     if demography is not None and len(demography) > 1:
-        logger.debug('Detected %s faces', format(len(demography)))
+        logger.info('Detected %s faces', format(len(demography)))
         return None
 
+    face_confidence = demography[0].get('face_confidence')
     age = demography[0].get('age')
-    gender = demography[0].get('gender')
+    gender = demography[0].get('dominant_gender')
     emotion = demography[0].get('dominant_emotion')
     race = demography[0].get('dominant_race')
 
-    logger.debug("age %s, gender %s, emotion %s, race %s" ,str(age), gender, emotion, race)
+    logger.info("face_confidence %s age %s, gender %s, emotion %s, race %s" ,str(face_confidence), str(age), gender, emotion, race)
+
+    logger.info('Exiting detect_facial_attribute_analysis()')
     return True
 
 def rescale(img):
     return cv2.resize(img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
 
-def ocr_analysis():
-    id_document = cv2.imread('Test_id_document.jpg')
+def ocr_analysis(id_document_file):
+    id_document_file_content = id_document_file.file.read()
+    id_document_file_bytes = np.frombuffer(id_document_file_content, numpy.uint8)
+    id_document = cv2.imdecode(id_document_file_bytes, cv2.IMREAD_UNCHANGED)
     id_document = cv2.cvtColor(id_document, cv2.COLOR_BGR2GRAY)
     ocr_data = pytesseract.image_to_data(rescale(id_document), output_type=pytesseract.Output.DICT)
     results = []
     n_boxes = len(ocr_data['text'])
 
     for i in range(n_boxes):
-        if int(ocr_data['conf'][i]) > 0.5:
+        if int(ocr_data['conf'][i]) > 90:
             word_data = {
                 "text": ocr_data['text'][i],
                 "left": ocr_data['left'][i],
@@ -56,31 +63,32 @@ def ocr_analysis():
             }
             results.append(word_data)
 
-    logger.debug('OCR DATA %s', json.dumps(results))
+    logger.info('OCR DATA %s', json.dumps(results))
+    return results
 
 def compare_faces(frame, image_path):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     image_from_frame_location = face_recognition.face_locations(rgb_frame, model='hog')
-    logger.debug(f"image_from_frame_location: {image_from_frame_location}")
+    logger.info(f"image_from_frame_location: {image_from_frame_location}")
 
     if len(image_from_frame_location) == 0:
-        logger.debug('image_from_frame_location is None')
+        logger.info('image_from_frame_location is None')
         return None
     image_from_frame_encodings = face_recognition.face_encodings(rgb_frame, image_from_frame_location)
-    logger.debug(f"image_from_frame_encodings: {image_from_frame_encodings}")
+    logger.info(f"image_from_frame_encodings: {image_from_frame_encodings}")
     if image_from_frame_encodings is not None and len(image_from_frame_encodings) > 1:
-        logger.debug("Found more than {} face(s)".format(len(image_from_frame_encodings)))
+        logger.info("Found more than {} face(s)".format(len(image_from_frame_encodings)))
         return None
 
     id_document_image = face_recognition.load_image_file(image_path)
     id_document_image_location = face_recognition.face_locations(id_document_image, model='hog')
-    logger.debug(f"id_document_image_location: {id_document_image_location}")
+    logger.info(f"id_document_image_location: {id_document_image_location}")
     id_document_image_encodings = face_recognition.face_encodings(id_document_image, id_document_image_location)
-    logger.debug(f"id_document_image_encodings: {id_document_image_encodings}")
+    logger.info(f"id_document_image_encodings: {id_document_image_encodings}")
 
     boolean_matches = face_recognition.compare_faces(image_from_frame_encodings, id_document_image_encodings[0])
-    logger.debug(f"boolean_matches: {boolean_matches}")
+    logger.info(f"boolean_matches: {boolean_matches}")
 
     if True in boolean_matches:
         cv2.rectangle(
@@ -125,7 +133,7 @@ def gen_frames():
         while camera.isOpened() and timeout > 0:
             success, frame = camera.read()
             if not success:
-                logger.debug({"error": "Error in getting frame from camera"})
+                logger.info({"error": "Error in getting frame from camera"})
                 break
             else:
                 ret, buffer = cv2.imencode('.jpg', frame)
@@ -188,6 +196,7 @@ async def websocket_endpoint(websocket: WebSocket):
             # --- PROCESS FRAME HERE (e.g., Face Detection) ---
             # Example: grayscale conversion
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            detect_facial_attribute_analysis(frame)
 
             out.write(frame)
             # out.release()
@@ -198,6 +207,14 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"Error: {e}")
     finally:
         await websocket.close()
+
+@app.post("/ocr_analysis")
+async def do_ocr_analysis(id_document_file: UploadFile):
+    return ocr_analysis(id_document_file)
+
+@app.post("/check_result")
+async def do_check_result(file: UploadFile, session_id: Annotated[uuid.UUID, Form()], attempt_no: Annotated[int, Form()]):
+    return {"session_id": session_id, "attempt_no": attempt_no}
 
 if __name__ == '__main__':
     app.run(debug=True)

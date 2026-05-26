@@ -1,7 +1,6 @@
 dlib
 face_recognition
-flask
-flask_cors
 deepface
 pytesseract
 fastapi
+python-multipart
