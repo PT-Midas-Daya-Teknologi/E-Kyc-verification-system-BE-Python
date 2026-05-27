@@ -75,23 +75,26 @@ def ocr_analysis(id_document_file):
     return results
 
 async def compare_faces(file, session_id, attempt_no):
-    user_document_model = session.query(UserDocument).filter(cast(UserDocument.session_id, String) == cast(session_id, String)).first()
-    if user_document_model is None:
-        logger.info({"error": "UserDocument not found for session_id"})
-        return None
+    try:
+        user_document_model = session.query(UserDocument).filter(cast(UserDocument.session_id, String) == cast(session_id, String)).first()
+        if user_document_model is None:
+            logger.info({"error": "UserDocument not found for session_id"})
+            return {"session_id": session_id, "attempt_no": attempt_no, "confidence": 0.0, "verified": False}
 
-    contents = await file.read()
-    image = Image.open(io.BytesIO(contents)).convert('RGB')
-    image_rgb = np.array(image)
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents)).convert('RGB')
+        image_rgb = np.array(image)
 
-    base64_decoded = base64.b64decode(user_document_model.content)
-    id_document_image = Image.open(io.BytesIO(base64_decoded))
-    id_document_image_rgb = np.array(id_document_image)
+        id_document_image = Image.open(io.BytesIO(user_document_model.content))
+        id_document_image_rgb = np.array(id_document_image)
 
-    result = DeepFace.verify(img1_path=image_rgb, img2_path=id_document_image_rgb, model_name="OpenFace", anti_spoofing=True)
-    logger.info("face_comparison_result: %s", result)
+        result = DeepFace.verify(img1_path=image_rgb, img2_path=id_document_image_rgb, model_name="OpenFace", anti_spoofing=True)
+        logger.info("face_comparison_result: %s", result)
 
-    return {"session_id": session_id, "attempt_no": attempt_no, "confidence": result.__getitem__('confidence'), "verified": result.__getitem__('verified')}
+        return {"session_id": session_id, "attempt_no": attempt_no, "confidence": result.__getitem__('confidence'), "verified": result.__getitem__('verified')}
+    except Exception as e:
+        logger.error("exception %s", e)
+        return {"session_id": session_id, "attempt_no": attempt_no, "confidence": 0.0, "verified": False}
 
 def gen_frames():
     global camera
