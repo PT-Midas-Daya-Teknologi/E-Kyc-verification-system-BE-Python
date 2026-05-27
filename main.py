@@ -1,6 +1,7 @@
 import uuid
-from typing import Any, Annotated
+from typing import Annotated
 
+import io
 import cv2
 import numpy
 import numpy as np
@@ -9,17 +10,24 @@ import json
 import logging
 import datetime
 import pytesseract
-import face_recognition
+from PIL import Image
 from deepface import DeepFace
+from sqlalchemy import create_engine, String, cast
 from fastapi import FastAPI, WebSocket, UploadFile, Form
+from sqlalchemy.orm import sessionmaker
 
-# app = Flask(__name__)
-# CORS(app)
+from models.user_document import UserDocument
+
 app = FastAPI()
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 file_handler = logging.FileHandler('face_recognition.log')
 logger.addHandler(file_handler)
+
+engine = create_engine('postgresql://postgres:postgres@localhost:5432/postgres')
+
+Session = sessionmaker(bind=engine)
+session = Session()
 
 def detect_facial_attribute_analysis(frame):
     logger.info('Inside detect_facial_attribute_analysis()')
@@ -66,58 +74,24 @@ def ocr_analysis(id_document_file):
     logger.info('OCR DATA %s', json.dumps(results))
     return results
 
-def compare_faces(frame, image_path):
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    image_from_frame_location = face_recognition.face_locations(rgb_frame, model='hog')
-    logger.info(f"image_from_frame_location: {image_from_frame_location}")
-
-    if len(image_from_frame_location) == 0:
-        logger.info('image_from_frame_location is None')
-        return None
-    image_from_frame_encodings = face_recognition.face_encodings(rgb_frame, image_from_frame_location)
-    logger.info(f"image_from_frame_encodings: {image_from_frame_encodings}")
-    if image_from_frame_encodings is not None and len(image_from_frame_encodings) > 1:
-        logger.info("Found more than {} face(s)".format(len(image_from_frame_encodings)))
+async def compare_faces(file, session_id, attempt_no):
+    user_document_model = session.query(UserDocument).filter(cast(UserDocument.session_id, String) == cast(session_id, String)).first()
+    if user_document_model is None:
+        logger.info({"error": "UserDocument not found for session_id"})
         return None
 
-    id_document_image = face_recognition.load_image_file(image_path)
-    id_document_image_location = face_recognition.face_locations(id_document_image, model='hog')
-    logger.info(f"id_document_image_location: {id_document_image_location}")
-    id_document_image_encodings = face_recognition.face_encodings(id_document_image, id_document_image_location)
-    logger.info(f"id_document_image_encodings: {id_document_image_encodings}")
+    contents = await file.read()
+    image = Image.open(io.BytesIO(contents)).convert('RGB')
+    image_rgb = np.array(image)
 
-    boolean_matches = face_recognition.compare_faces(image_from_frame_encodings, id_document_image_encodings[0])
-    logger.info(f"boolean_matches: {boolean_matches}")
+    base64_decoded = base64.b64decode(user_document_model.content)
+    id_document_image = Image.open(io.BytesIO(base64_decoded))
+    id_document_image_rgb = np.array(id_document_image)
 
-    if True in boolean_matches:
-        cv2.rectangle(
-            frame,
-            (image_from_frame_location[0][3], image_from_frame_location[0][0]),
-            (image_from_frame_location[0][1], image_from_frame_location[0][2]),
-            (0, 0, 255),
-            2)
+    result = DeepFace.verify(img1_path=image_rgb, img2_path=id_document_image_rgb, model_name="OpenFace", anti_spoofing=True)
+    logger.info("face_comparison_result: %s", result)
 
-        cv2.rectangle(
-            frame,
-            (image_from_frame_location[0][3], image_from_frame_location[0][2] - 35),
-            (image_from_frame_location[0][1], image_from_frame_location[0][2]),
-            (0, 0, 255),
-            cv2.FILLED
-        )
-
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(
-            frame,
-            "TEST USER",
-            (image_from_frame_location[0][3] + 6, image_from_frame_location[0][2] - 6),
-            font,
-            1.0,
-            (255, 255, 255),
-            1)
-        return frame
-
-    return None
+    return {"session_id": session_id, "attempt_no": attempt_no, "confidence": result.__getitem__('confidence'), "verified": result.__getitem__('verified')}
 
 def gen_frames():
     global camera
@@ -214,7 +188,7 @@ async def do_ocr_analysis(id_document_file: UploadFile):
 
 @app.post("/check_result")
 async def do_check_result(file: UploadFile, session_id: Annotated[uuid.UUID, Form()], attempt_no: Annotated[int, Form()]):
-    return {"session_id": session_id, "attempt_no": attempt_no}
+    return await compare_faces(file, session_id, attempt_no)
 
 if __name__ == '__main__':
     app.run(debug=True)

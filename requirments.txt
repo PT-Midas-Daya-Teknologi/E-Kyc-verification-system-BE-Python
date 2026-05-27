@@ -1,6 +1,7 @@
 dlib
-face_recognition
 deepface
 pytesseract
-fastapi
+fastapi[standard]
 python-multipart
+sqlalchemy
+psycopg2
