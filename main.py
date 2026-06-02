@@ -1,4 +1,7 @@
+import os
 import uuid
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated
 
 import io
@@ -13,10 +16,13 @@ import pytesseract
 from PIL import Image
 from deepface import DeepFace
 from sqlalchemy import create_engine, String, cast
-from fastapi import FastAPI, WebSocket, UploadFile, Form
+from fastapi import FastAPI, WebSocket, UploadFile, Form, Query, WebSocketDisconnect
 from sqlalchemy.orm import sessionmaker
 
 from models.user_document import UserDocument
+
+# Add Tesseract executable path 
+pytesseract.pytesseract.tesseract_cmd = r'D:\tessract_ocr\tesseract.exe'
 
 app = FastAPI()
 logger = logging.getLogger()
@@ -24,28 +30,31 @@ logger.setLevel(logging.DEBUG)
 file_handler = logging.FileHandler('face_recognition.log')
 logger.addHandler(file_handler)
 
-engine = create_engine('postgresql://postgres:postgres@localhost:5432/postgres')
+# Align with Spring Boot datasource (application.yml uses password root)
+engine = create_engine(
+    os.getenv(
+        "DATABASE_URL",
+        "postgresql://postgres:root@localhost:5432/postgres",
+    )
+)
 
 Session = sessionmaker(bind=engine)
 session = Session()
 
-def detect_facial_attribute_analysis(frame):
-    logger.info('Inside detect_facial_attribute_analysis()')
-    demography = DeepFace.analyze(frame, actions=['age', 'gender', 'emotion', 'race'], enforce_detection=False, detector_backend='dlib')
-    if demography is not None and len(demography) > 1:
-        logger.info('Detected %s faces', format(len(demography)))
-        return None
+# In-memory cache so the Java service can poll results while face match runs
+_check_result_cache: dict[str, dict] = {}
 
-    face_confidence = demography[0].get('face_confidence')
-    age = demography[0].get('age')
-    gender = demography[0].get('dominant_gender')
-    emotion = demography[0].get('dominant_emotion')
-    race = demography[0].get('dominant_race')
+# DeepFace face match is CPU-bound; never run it on the asyncio event loop
+_face_match_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="face-match")
 
-    logger.info("face_confidence %s age %s, gender %s, emotion %s, race %s" ,str(face_confidence), str(age), gender, emotion, race)
+def cache_check_result(session_id, response: dict) -> None:
+    _check_result_cache[str(session_id)] = response
 
-    logger.info('Exiting detect_facial_attribute_analysis()')
-    return True
+
+def format_check_result(confidence: float, verified: bool) -> dict:
+    face_score = f"{round(float(confidence), 1)}"
+    final_result = "VERIFIED" if verified else "REJECTED"
+    return {"face_score": face_score, "final_result": final_result}
 
 def rescale(img):
     return cv2.resize(img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
@@ -74,27 +83,91 @@ def ocr_analysis(id_document_file):
     logger.info('OCR DATA %s', json.dumps(results))
     return results
 
-async def compare_faces(file, session_id, attempt_no):
+def _compare_faces_sync(session_id: str, image_bytes: bytes, attempt_no: int) -> dict:
+    """CPU-bound face match — must not run on the asyncio event loop."""
+    db = Session()
     try:
-        user_document_model = session.query(UserDocument).filter(cast(UserDocument.session_id, String) == cast(session_id, String)).first()
+        user_document_model = (
+            db.query(UserDocument)
+            .filter(cast(UserDocument.session_id, String) == cast(session_id, String))
+            .first()
+        )
         if user_document_model is None:
-            logger.info({"error": "UserDocument not found for session_id"})
-            return {"session_id": session_id, "attempt_no": attempt_no, "confidence": 0.0, "verified": False}
+            logger.info({"error": "UserDocument not found for session_id", "session_id": session_id})
+            formatted = format_check_result(0.0, False)
+            response = {
+                "session_id": session_id,
+                "attempt_no": attempt_no,
+                "confidence": 0.0,
+                "verified": False,
+                **formatted,
+            }
+            cache_check_result(session_id, response)
+            return response
 
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert('RGB')
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         image_rgb = np.array(image)
 
         id_document_image = Image.open(io.BytesIO(user_document_model.content))
         id_document_image_rgb = np.array(id_document_image)
 
-        result = DeepFace.verify(img1_path=image_rgb, img2_path=id_document_image_rgb, model_name="OpenFace", anti_spoofing=True)
+        result = DeepFace.verify(
+            img1_path=image_rgb,
+            img2_path=id_document_image_rgb,
+            model_name="OpenFace",
+            anti_spoofing=True,
+        )
         logger.info("face_comparison_result: %s", result)
 
-        return {"session_id": session_id, "attempt_no": attempt_no, "confidence": result.__getitem__('confidence'), "verified": result.__getitem__('verified')}
+        confidence = float(result.__getitem__("confidence"))
+        verified = bool(result.__getitem__("verified"))
+        formatted = format_check_result(confidence, verified)
+        response = {
+            "session_id": session_id,
+            "attempt_no": attempt_no,
+            "confidence": confidence,
+            "verified": verified,
+            **formatted,
+        }
+        cache_check_result(session_id, response)
+        return response
     except Exception as e:
         logger.error("exception %s", e)
-        return {"session_id": session_id, "attempt_no": attempt_no, "confidence": 0.0, "verified": False}
+        formatted = format_check_result(0.0, False)
+        response = {
+            "session_id": session_id,
+            "attempt_no": attempt_no,
+            "confidence": 0.0,
+            "verified": False,
+            **formatted,
+        }
+        cache_check_result(session_id, response)
+        return response
+    finally:
+        db.close()
+
+
+async def compare_faces(file, session_id, attempt_no):
+    contents = await file.read()
+
+    cache_check_result(
+        session_id,
+        {
+            "session_id": str(session_id),
+            "attempt_no": int(attempt_no),
+            "face_score": "N/A",
+            "final_result": "PROCESSING",
+        },
+    )
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _face_match_executor,
+        _compare_faces_sync,
+        str(session_id),
+        contents,
+        int(attempt_no),
+    )
 
 def gen_frames():
     global camera
@@ -116,20 +189,7 @@ def gen_frames():
                 ret, buffer = cv2.imencode('.jpg', frame)
                 buffer_bytes = buffer.tobytes()
 
-                new_frame_face_analysis = detect_facial_attribute_analysis(frame)
-
-                if new_frame_face_analysis is not None:
-                    ocr_analysis()
-                    # face_recognition_frame = compare_faces(frame, 'Test_id_document.jpg')
-                    # if face_recognition_frame is not None:
-                    #     out.write(face_recognition_frame)
-                    #     print({"success": "Face detection and comparison successful"})
-                    #     is_success = True
-                    #     # break
-                    # else:
-                    #     print({"error": "Error in face comparison"})
-                else:
-                    print({"error": "No face detected"})
+                # Frames-only (do not run DeepFace.analyze here; it blocks the server)
                 # if cv2.waitKey(1) & 0xFF == ord('q'):  # quit when 'q' is pressed
                 #     break
                 timeout-=1
@@ -170,28 +230,40 @@ async def websocket_endpoint(websocket: WebSocket):
             np_data = np.frombuffer(data_bytes, dtype=np.uint8)
             frame = cv2.imdecode(np_data, cv2.IMREAD_COLOR)
 
-            # --- PROCESS FRAME HERE (e.g., Face Detection) ---
-            # Example: grayscale conversion
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            detect_facial_attribute_analysis(frame)
-
+            # Frames-only (do not run DeepFace.analyze here; it blocks /check_result)
             out.write(frame)
             # out.release()
 
             # (Optional) Send result back to React
             await websocket.send_text("Frame Processed")
+    except WebSocketDisconnect:
+        # Client closed the connection; nothing to do.
+        pass
     except Exception as e:
-        print(f"Error: {e}")
+        logger.exception("WebSocket error: %s", e)
     finally:
-        await websocket.close()
+        out.release()
 
 @app.post("/ocr_analysis")
 async def do_ocr_analysis(id_document_file: UploadFile):
     return ocr_analysis(id_document_file)
 
+@app.get("/check_result")
+async def get_check_result(session_id: Annotated[str, Query()]):
+    cached = _check_result_cache.get(str(session_id))
+    if cached:
+        return cached
+    return {"face_score": "N/A", "final_result": "PENDING"}
+
 @app.post("/check_result")
-async def do_check_result(file: UploadFile, session_id: Annotated[uuid.UUID, Form()], attempt_no: Annotated[int, Form()]):
+async def do_check_result(
+    file: UploadFile,
+    session_id: Annotated[str, Form()],
+    attempt_no: Annotated[int, Form()] = 1,
+):
     return await compare_faces(file, session_id, attempt_no)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
