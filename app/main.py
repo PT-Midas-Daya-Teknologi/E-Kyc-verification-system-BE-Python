@@ -1,3 +1,4 @@
+import os
 import uuid
 from typing import Annotated
 
@@ -12,11 +13,12 @@ import datetime
 import pytesseract
 from PIL import Image
 from deepface import DeepFace
+from dotenv import load_dotenv
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy import create_engine, String, cast
 from fastapi import FastAPI, WebSocket, UploadFile, Form
-from sqlalchemy.orm import sessionmaker
 
-from models.user_document import UserDocument
+from app.models.user_document import UserDocument
 
 app = FastAPI()
 logger = logging.getLogger()
@@ -24,7 +26,18 @@ logger.setLevel(logging.DEBUG)
 file_handler = logging.FileHandler('face_recognition.log')
 logger.addHandler(file_handler)
 
-engine = create_engine('postgresql://postgres:postgres@localhost:5432/postgres')
+env = os.getenv("APP_ENV")
+
+env_file = f".env.{env}"
+
+if os.path.exists(env_file):
+    load_dotenv(dotenv_path=env_file)
+else:
+    print(f"Warning: {env_file} not found for {env}, hence exiting")
+    logger.error("Warning: %s not found, hence exiting", env_file)
+    exit(1)
+
+engine = create_engine(f"postgresql://{os.getenv("DB_USER")}:{os.getenv("DB_PASSWORD")}@{os.getenv("DB_HOST")}:5432/{os.getenv('DB_NAME')}");
 
 Session = sessionmaker(bind=engine)
 session = Session()
@@ -148,9 +161,9 @@ def gen_frames():
         out.release()
         cv2.destroyAllWindows()
 
-# @app.route('/video_feed')
-# def video_feed():
-#     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.get('/health_check')
+def health_check():
+    return {"status": "healthy"}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
