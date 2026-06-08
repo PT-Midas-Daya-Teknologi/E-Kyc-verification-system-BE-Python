@@ -14,11 +14,17 @@ import pytesseract
 from PIL import Image
 from deepface import DeepFace
 from dotenv import load_dotenv
+from fastapi.params import Body
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import create_engine, String, cast
-from fastapi import FastAPI, WebSocket, UploadFile, Form
+from sqlalchemy import create_engine, String, cast, true, update
+from fastapi import FastAPI, WebSocket, UploadFile, Form, HTTPException
+from starlette.responses import FileResponse
 
 from app.models.user_document import UserDocument
+from app.models.user_session import UserSession
+from app.models.user_video import UserVideo
+from app.service.JwtService import validate_token
+from app.service.Session import get_session
 
 app = FastAPI()
 logger = logging.getLogger()
@@ -36,11 +42,6 @@ else:
     print(f"Warning: {env_file} not found for {env}, hence exiting")
     logger.error("Warning: %s not found, hence exiting", env_file)
     exit(1)
-
-engine = create_engine(f"postgresql://{os.getenv("DB_USER")}:{os.getenv("DB_PASSWORD")}@{os.getenv("DB_HOST")}:5432/{os.getenv('DB_NAME')}");
-
-Session = sessionmaker(bind=engine)
-session = Session()
 
 def detect_facial_attribute_analysis(frame):
     logger.info('Inside detect_facial_attribute_analysis()')
@@ -89,8 +90,8 @@ def ocr_analysis(id_document_file):
 
 async def compare_faces(file, session_id, attempt_no):
     try:
-        user_document_model = session.query(UserDocument).filter(cast(UserDocument.session_id, String) == cast(session_id, String)).first()
-        session.close()
+        user_document_model = get_session().query(UserDocument).filter(cast(UserDocument.session_id, String) == cast(session_id, String)).first()
+        get_session().close()
         if user_document_model is None:
             logger.info({"error": "UserDocument not found for session_id"})
             return {"session_id": session_id, "attempt_no": attempt_no, "confidence": 0.0, "verified": False}
@@ -109,6 +110,20 @@ async def compare_faces(file, session_id, attempt_no):
     except Exception as e:
         logger.error("exception %s", e)
         return {"session_id": session_id, "attempt_no": attempt_no, "confidence": 0.0, "verified": False}
+
+async def find_video(video_id):
+    user_video_model = get_session().query(UserVideo).where(cast(UserVideo.id, String) == cast(video_id, String)).first()
+    get_session().close()
+    if user_video_model is None:
+        logger.info({"error": "UserVideo not found for video_id"})
+        raise HTTPException(status_code=404, detail="UserVideo not found for video_id")
+
+    file_path = os.path.join(os.getcwd(), user_video_model.path)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="UserVideo not found for video_id")
+
+    return FileResponse(file_path, media_type="video/mp4")
 
 def gen_frames():
     global camera
@@ -165,13 +180,28 @@ def gen_frames():
 def health_check():
     return {"status": "healthy"}
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+@app.websocket("/ws/{token}")
+async def websocket_endpoint(websocket: WebSocket, token: str):
+    if token is None:
+        raise HTTPException(status_code=400, detail="Token is missing")
+
+    user_session = validate_token(token)
+
     await websocket.accept()
 
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     file_name = "demo-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + ".avi"
     out = cv2.VideoWriter(file_name, fourcc, 10.0, (640, 480))
+
+    user_video = UserVideo(id=uuid.uuid4(), name=file_name, path=file_name, created_at=datetime.datetime.now(), created_by="SYSTEM", updated_at=datetime.datetime.now(), updated_by="SYSTEM", is_active=true())
+    session = get_session()
+    session.add(user_video)
+
+    update_session_data = {"video_id": user_video.id}
+    stmt = (update(UserSession)).where(UserSession.id == user_session.id).values(update_session_data)
+    session.execute(stmt)
+    session.commit()
+    session.close()
 
     try:
         while True:
@@ -206,6 +236,10 @@ async def do_ocr_analysis(id_document_file: UploadFile):
 @app.post("/check_result")
 async def do_check_result(file: UploadFile, session_id: Annotated[uuid.UUID, Form()], attempt_no: Annotated[int, Form()]):
     return await compare_faces(file, session_id, attempt_no)
+
+@app.post("/video")
+async def send_video(video_id: Annotated[uuid.UUID, Body(embed=True)]):
+    return await find_video(video_id)
 
 if __name__ == '__main__':
     app.run(debug=True)
