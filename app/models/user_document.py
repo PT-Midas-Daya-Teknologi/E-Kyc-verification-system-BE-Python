@@ -1,6 +1,5 @@
-from models.base import Base
-from sqlalchemy.dialects.postgresql import OID
-from sqlalchemy import Column, Integer, String, UUID, JSON, LargeBinary
+from app.models.base import Base
+from sqlalchemy import Column, String, UUID, JSON, LargeBinary
 
 
 class UserDocument(Base):

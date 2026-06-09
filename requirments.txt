@@ -1,7 +1,0 @@
-dlib
-deepface
-pytesseract
-fastapi[standard]
-python-multipart
-sqlalchemy
-psycopg2

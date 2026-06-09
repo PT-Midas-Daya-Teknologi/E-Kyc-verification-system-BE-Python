@@ -1,5 +1,5 @@
-from models.base import Base
-from sqlalchemy import Column, Integer, String, UUID, JSON, Boolean, DateTime
+from app.models.base import Base
+from sqlalchemy import Column, Integer, UUID, JSON, Boolean, DateTime
 
 
 class UserSession(Base):
