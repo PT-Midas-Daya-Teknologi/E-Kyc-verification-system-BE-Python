@@ -98,12 +98,14 @@ async def compare_faces(file, session_id, attempt_no):
 
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert('RGB')
+        image.save("uploaded_file.jpg")
         image_rgb = np.array(image)
 
         id_document_image = Image.open(io.BytesIO(user_document_model.content))
         id_document_image_rgb = np.array(id_document_image)
 
-        result = DeepFace.verify(img1_path=image_rgb, img2_path=id_document_image_rgb, model_name="OpenFace", anti_spoofing=True)
+        result = DeepFace.verify(img1_path="uploaded_file.jpg", img2_path=id_document_image_rgb)
+        os.remove("uploaded_file.jpg")
         logger.info("face_comparison_result: %s", result)
 
         return {"session_id": session_id, "attempt_no": attempt_no, "confidence": result.__getitem__('confidence'), "verified": result.__getitem__('verified')}
