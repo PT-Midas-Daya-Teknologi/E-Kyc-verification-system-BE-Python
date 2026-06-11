@@ -9,6 +9,12 @@ RUN apt-get update && apt-get install tesseract-ocr tesseract-ocr-eng -y
 
 RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
 
+COPY download_pre_trained_models.py /code
+
+RUN python /code/download_pre_trained_models.py
+
+RUN rm /code/download_pre_trained_models.py
+
 ENV APP_ENV=docker
 
 COPY ./app /code/app
